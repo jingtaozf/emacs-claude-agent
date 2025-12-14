@@ -1,0 +1,153 @@
+#+TITLE: Claude Agent SDK for Emacs
+#+AUTHOR: Jingtao Xu
+
+* Overview
+
+This is an Emacs client library for the [[https://claude.ai/code][Claude Code CLI]], implemented using literate programming in Org mode.
+
+The library mirrors the Python Claude Agent SDK API, providing:
+- ~claude-agent-query~ for one-shot queries
+- ~claude-agent-client~ for bidirectional interactive conversations
+- Streaming response support via callbacks
+- Basic hook support (PreToolUse, PostToolUse, Stop)
+- Session management (continue, resume)
+
+* Prerequisites
+
+- Emacs 27.1+
+- Claude Code CLI installed (~npm install -g @anthropic-ai/claude-code~ or via [[https://claude.ai/install.sh][install script]])
+- [[https://github.com/jingtaoxu/literate-elisp][literate-elisp]] for loading the org file directly
+
+* Installation
+
+** Direct Loading (Development)
+
+#+BEGIN_SRC elisp
+(require 'literate-elisp)
+(literate-elisp-load "~/projects/claude-agent/claude-agent.org")
+#+END_SRC
+
+** Tangled File
+
+Generate ~claude-agent.el~ from the org file:
+
+#+BEGIN_SRC elisp
+(require 'literate-elisp)
+(literate-elisp-tangle "~/projects/claude-agent/claude-agent.org")
+#+END_SRC
+
+Then add to load-path:
+
+#+BEGIN_SRC elisp
+(add-to-list 'load-path "~/projects/claude-agent/")
+(require 'claude-agent)
+#+END_SRC
+
+* Usage
+
+** One-shot Query
+
+#+BEGIN_SRC elisp
+(claude-agent-query
+ "What is 2+2?"
+ :on-message (lambda (msg)
+               (when (claude-agent-assistant-message-p msg)
+                 (message "Response: %s"
+                          (claude-agent-extract-text msg))))
+ :on-complete (lambda (_) (message "Done!")))
+#+END_SRC
+
+** With Options
+
+#+BEGIN_SRC elisp
+(claude-agent-query
+ "Explain this code"
+ :options (claude-agent-options
+           :model "claude-sonnet-4-5"
+           :max-turns 3
+           :permission-mode 'accept-edits)
+ :on-message #'my-message-handler)
+#+END_SRC
+
+** Interactive Client
+
+#+BEGIN_SRC elisp
+(let ((client (claude-agent-client-create
+               :options (claude-agent-options :model "claude-sonnet-4-5")
+               :on-message (lambda (msg)
+                             (message "Got: %s" (claude-agent-message-type msg))))))
+  (claude-agent-client-connect client "Hello, Claude!")
+  ;; Later...
+  (claude-agent-client-send client "Follow-up question"))
+#+END_SRC
+
+** Session Management
+
+#+BEGIN_SRC elisp
+;; Resume a previous session
+(let ((client (claude-agent-client-create)))
+  (claude-agent-resume-session client "session-id-here")
+  (claude-agent-client-connect client))
+
+;; Continue from last conversation
+(let ((client (claude-agent-client-create)))
+  (claude-agent-continue-session client)
+  (claude-agent-client-connect client))
+#+END_SRC
+
+* Customization
+
+#+BEGIN_SRC elisp
+;; Set default model
+(setq claude-agent-default-model "claude-sonnet-4-5")
+
+;; Explicit CLI path
+(setq claude-agent-cli-path "/path/to/claude")
+
+;; Enable debug logging
+(setq claude-agent-debug t)
+#+END_SRC
+
+* API Reference
+
+** Functions
+
+- ~claude-agent-query~ - Send one-shot query
+- ~claude-agent-options~ - Create options plist
+- ~claude-agent-extract-text~ - Extract text from assistant message
+- ~claude-agent-extract-tool-uses~ - Extract tool use blocks
+- ~claude-agent-extract-thinking~ - Extract thinking content
+- ~claude-agent-message-type~ - Get message type symbol
+
+** Client Functions
+
+- ~claude-agent-client-create~ - Create new client
+- ~claude-agent-client-connect~ - Connect to Claude
+- ~claude-agent-client-send~ - Send message
+- ~claude-agent-client-disconnect~ - Disconnect
+- ~claude-agent-client-interrupt~ - Interrupt current operation
+
+** Session Functions
+
+- ~claude-agent-continue-session~ - Continue previous session
+- ~claude-agent-resume-session~ - Resume specific session
+- ~claude-agent-get-session-id~ - Get current session ID
+
+** Hook Functions
+
+- ~claude-agent-add-hook~ - Add hook callback
+
+* Running Tests
+
+#+BEGIN_SRC sh
+emacs -Q --batch \
+  -L ~/projects/literate-elisp \
+  --load literate-elisp \
+  --eval "(setf literate-elisp-test-p t)" \
+  --eval "(literate-elisp-load (expand-file-name \"~/projects/claude-agent/claude-agent.org\"))" \
+  --funcall ert-run-tests-batch
+#+END_SRC
+
+* License
+
+MIT

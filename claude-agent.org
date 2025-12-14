@@ -1,0 +1,1541 @@
+# -*- encoding:utf-8 Mode: POLY-ORG; org-src-preserve-indentation: t; -*-
+#+TITLE: Claude Agent SDK for Emacs
+#+SUBTITLE: Emacs client for Claude Code CLI
+#+AUTHOR: Jingtao Xu
+#+OPTIONS: toc:2
+#+Startup: noindent
+#+PROPERTY: header-args :results silent
+#+PROPERTY: literate-lang elisp
+#+PROPERTY: literate-load yes
+
+* Table of Contents                                            :TOC:noexport:
+- [[#introduction][Introduction]]
+- [[#dependencies-and-requirements][Dependencies and Requirements]]
+  - [[#package-header][Package Header]]
+  - [[#required-libraries][Required Libraries]]
+- [[#customization-variables][Customization Variables]]
+- [[#error-handling][Error Handling]]
+- [[#data-structures][Data Structures]]
+  - [[#options][Options]]
+  - [[#content-block-types][Content Block Types]]
+  - [[#message-types][Message Types]]
+  - [[#hook-types][Hook Types]]
+- [[#process-management][Process Management]]
+  - [[#cli-discovery][CLI Discovery]]
+  - [[#argument-builder][Argument Builder]]
+  - [[#process-state][Process State]]
+  - [[#process-filter][Process Filter]]
+  - [[#process-sentinel][Process Sentinel]]
+  - [[#process-creation][Process Creation]]
+- [[#json-protocol][JSON Protocol]]
+  - [[#content-block-parsing][Content Block Parsing]]
+  - [[#message-parsing][Message Parsing]]
+- [[#core-api][Core API]]
+  - [[#query-function][Query Function]]
+  - [[#helper-functions][Helper Functions]]
+- [[#client-api][Client API]]
+  - [[#client-structure][Client Structure]]
+  - [[#client-creation][Client Creation]]
+  - [[#client-methods][Client Methods]]
+- [[#hook-system][Hook System]]
+  - [[#hook-input-structures][Hook Input Structures]]
+  - [[#hook-invocation][Hook Invocation]]
+- [[#session-management][Session Management]]
+- [[#tests][Tests]]
+  - [[#unit-tests][Unit Tests]]
+- [[#package-footer][Package Footer]]
+- [[#release][Release]]
+
+* Introduction
+
+This is an Emacs client library for the [[https://claude.ai/code][Claude Code CLI]]. It provides a
+literate programming implementation of the Claude Agent SDK, allowing
+Emacs users to interact with Claude programmatically.
+
+The library mirrors the Python Claude Agent SDK API, providing:
+- ~claude-agent-query~ for one-shot queries
+- ~claude-agent-client~ for bidirectional interactive conversations
+- Streaming response support via callbacks
+- Basic hook support (PreToolUse, PostToolUse, Stop)
+- Session management (continue, resume)
+
+** Usage Example
+
+#+BEGIN_SRC elisp :load no
+;; One-shot query
+(claude-agent-query
+ "What is 2+2?"
+ :on-message (lambda (msg)
+               (when (claude-agent-assistant-message-p msg)
+                 (message "Response: %s"
+                          (claude-agent-extract-text msg))))
+ :on-complete (lambda (_) (message "Done!")))
+
+;; Interactive client
+(let ((client (claude-agent-client-create
+               :options (claude-agent-options
+                         :model "claude-sonnet-4-5"
+                         :permission-mode 'accept-edits))))
+  (claude-agent-client-connect client)
+  (claude-agent-client-send
+   client "Hello, Claude!"
+   :on-response (lambda (msg) (message "Got: %s" msg))))
+#+END_SRC
+
+* Dependencies and Requirements
+
+** Package Header
+
+#+BEGIN_SRC elisp
+;;; claude-agent.el --- Emacs client for Claude Code CLI -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2024 Jingtao Xu
+
+;; Author: Jingtao Xu
+;; Version: 0.1.0
+;; Package-Requires: ((emacs "27.1"))
+;; Keywords: tools, processes, ai
+;; URL: https://github.com/user/claude-agent
+
+;; This file is not part of GNU Emacs.
+
+;;; Commentary:
+
+;; Claude Agent SDK for Emacs - A client library for the Claude Code CLI.
+;; This package provides async subprocess communication with Claude,
+;; streaming responses, and hook support.
+
+;;; Code:
+#+END_SRC
+
+** Required Libraries
+
+#+BEGIN_SRC elisp
+(require 'cl-lib)
+(require 'json)
+(require 'subr-x)
+#+END_SRC
+
+* Customization Variables
+
+#+BEGIN_SRC elisp
+(defgroup claude-agent nil
+  "Claude Agent SDK for Emacs."
+  :group 'tools
+  :prefix "claude-agent-")
+
+(defcustom claude-agent-cli-path nil
+  "Path to the Claude Code CLI binary.
+If nil, the CLI will be searched in PATH and common locations."
+  :type '(choice (const nil :tag "Auto-detect")
+                 (file :tag "Explicit path"))
+  :group 'claude-agent)
+
+(defcustom claude-agent-cli-search-paths
+  '("~/.npm-global/bin/claude"
+    "/usr/local/bin/claude"
+    "~/.local/bin/claude"
+    "~/node_modules/.bin/claude"
+    "~/.yarn/bin/claude"
+    "~/.claude/local/claude")
+  "List of paths to search for the Claude Code CLI."
+  :type '(repeat string)
+  :group 'claude-agent)
+
+(defcustom claude-agent-default-model nil
+  "Default model to use for queries.
+If nil, uses the CLI default."
+  :type '(choice (const nil :tag "CLI default")
+                 (string :tag "Model name"))
+  :group 'claude-agent)
+
+(defcustom claude-agent-debug nil
+  "When non-nil, enable debug logging."
+  :type 'boolean
+  :group 'claude-agent)
+#+END_SRC
+
+* Error Handling
+
+Define error conditions for the SDK.
+
+#+BEGIN_SRC elisp
+(define-error 'claude-agent-error
+  "Claude Agent SDK error")
+
+(define-error 'claude-agent-cli-not-found-error
+  "Claude Code CLI not found"
+  'claude-agent-error)
+
+(define-error 'claude-agent-cli-connection-error
+  "Cannot connect to Claude CLI"
+  'claude-agent-error)
+
+(define-error 'claude-agent-process-error
+  "Claude CLI process error"
+  'claude-agent-error)
+
+(define-error 'claude-agent-json-decode-error
+  "JSON decode error"
+  'claude-agent-error)
+
+(define-error 'claude-agent-message-parse-error
+  "Message parse error"
+  'claude-agent-error)
+#+END_SRC
+
+* Data Structures
+
+** Options
+
+The options plist mirrors the Python ~ClaudeAgentOptions~ dataclass.
+
+#+BEGIN_SRC elisp
+(defun claude-agent-options (&rest args)
+  "Create a Claude Agent options plist.
+
+Supported keyword arguments:
+  :system-prompt      - System prompt string
+  :allowed-tools      - List of allowed tool names
+  :disallowed-tools   - List of disallowed tool names
+  :max-turns          - Maximum conversation turns (integer)
+  :max-budget-usd     - Maximum budget in USD (number)
+  :model              - Model name string
+  :permission-mode    - One of: default, accept-edits, plan, bypass-permissions
+  :continue-conversation - Boolean to continue previous conversation
+  :resume             - Session ID string to resume
+  :cwd                - Working directory for CLI
+  :cli-path           - Path to Claude CLI binary
+  :hooks              - Alist of (event . matchers)
+  :env                - Alist of environment variables
+
+Returns a plist suitable for passing to `claude-agent-query' or
+`claude-agent-client-create'."
+  ;; Use `list' instead of quoted literal to avoid destructive modification
+  (let ((defaults (list :system-prompt nil
+                        :allowed-tools nil
+                        :disallowed-tools nil
+                        :max-turns nil
+                        :max-budget-usd nil
+                        :model nil
+                        :permission-mode nil
+                        :continue-conversation nil
+                        :resume nil
+                        :cwd nil
+                        :cli-path nil
+                        :hooks nil
+                        :env nil)))
+    (cl-loop for (key val) on args by #'cddr
+             do (setq defaults (plist-put defaults key val)))
+    defaults))
+
+(defun claude-agent-options-get (options key &optional default)
+  "Get KEY from OPTIONS plist, returning DEFAULT if not found."
+  (let ((val (plist-get options key)))
+    (if val val default)))
+#+END_SRC
+
+** Content Block Types
+
+Content blocks represent different types of content in messages.
+
+#+BEGIN_SRC elisp
+(cl-defstruct (claude-agent-text-block
+               (:constructor claude-agent-make-text-block)
+               (:copier nil))
+  "Text content block."
+  text)
+
+(cl-defstruct (claude-agent-thinking-block
+               (:constructor claude-agent-make-thinking-block)
+               (:copier nil))
+  "Thinking content block (extended thinking)."
+  thinking
+  signature)
+
+(cl-defstruct (claude-agent-tool-use-block
+               (:constructor claude-agent-make-tool-use-block)
+               (:copier nil))
+  "Tool use content block."
+  id
+  name
+  input)
+
+(cl-defstruct (claude-agent-tool-result-block
+               (:constructor claude-agent-make-tool-result-block)
+               (:copier nil))
+  "Tool result content block."
+  tool-use-id
+  content
+  is-error)
+#+END_SRC
+
+** Message Types
+
+Message types mirror the Python SDK discriminated union.
+
+#+BEGIN_SRC elisp
+(cl-defstruct (claude-agent-user-message
+               (:constructor claude-agent-make-user-message)
+               (:copier nil))
+  "User message."
+  content
+  parent-tool-use-id)
+
+(cl-defstruct (claude-agent-assistant-message
+               (:constructor claude-agent-make-assistant-message)
+               (:copier nil))
+  "Assistant message with content blocks."
+  content      ; List of content blocks
+  model
+  parent-tool-use-id
+  error)       ; Error info if present
+
+(cl-defstruct (claude-agent-system-message
+               (:constructor claude-agent-make-system-message)
+               (:copier nil))
+  "System message with metadata."
+  subtype
+  data)
+
+(cl-defstruct (claude-agent-result-message
+               (:constructor claude-agent-make-result-message)
+               (:copier nil))
+  "Result message with cost and usage information."
+  subtype
+  duration-ms
+  duration-api-ms
+  is-error
+  num-turns
+  session-id
+  total-cost-usd
+  usage
+  result)
+#+END_SRC
+
+** Hook Types
+
+#+BEGIN_SRC elisp
+(cl-defstruct (claude-agent-hook-matcher
+               (:constructor claude-agent-make-hook-matcher)
+               (:copier nil))
+  "Hook matcher configuration."
+  matcher      ; String pattern (tool name) or nil for all
+  callbacks    ; List of callback functions
+  (timeout 60.0)) ; Timeout in seconds
+
+(defconst claude-agent-hook-events
+  '(PreToolUse PostToolUse UserPromptSubmit Stop SubagentStop)
+  "List of supported hook event types.")
+#+END_SRC
+
+* Process Management
+
+** CLI Discovery
+
+#+BEGIN_SRC elisp
+(defun claude-agent--find-cli ()
+  "Find the Claude Code CLI binary.
+Returns the path to the CLI or signals an error if not found."
+  (or claude-agent-cli-path
+      (executable-find "claude")
+      (cl-find-if #'file-executable-p
+                  (mapcar #'expand-file-name
+                          claude-agent-cli-search-paths))
+      (signal 'claude-agent-cli-not-found-error
+              (list "Claude Code CLI not found. Install with: npm install -g @anthropic-ai/claude-code"))))
+
+(defun claude-agent--cli-version ()
+  "Get the Claude Code CLI version.
+Returns version string or nil if unable to determine."
+  (condition-case nil
+      (let ((output (shell-command-to-string
+                     (format "%s -v" (claude-agent--find-cli)))))
+        (when (string-match "\\([0-9]+\\.[0-9]+\\.[0-9]+\\)" output)
+          (match-string 1 output)))
+    (error nil)))
+#+END_SRC
+
+** Argument Builder
+
+Build CLI arguments from options plist.
+
+#+BEGIN_SRC elisp
+(defun claude-agent--permission-mode-to-string (mode)
+  "Convert permission MODE symbol to CLI string."
+  (pcase mode
+    ('default "default")
+    ('accept-edits "acceptEdits")
+    ('plan "plan")
+    ('bypass-permissions "bypassPermissions")
+    ((pred stringp) mode)
+    (_ nil)))
+
+(defun claude-agent--build-args (options &optional streaming-p)
+  "Build CLI arguments from OPTIONS plist.
+If STREAMING-P is non-nil, use streaming input mode."
+  (let ((args (list "--output-format" "stream-json" "--verbose")))
+    ;; System prompt
+    (let ((system-prompt (plist-get options :system-prompt)))
+      (when system-prompt
+        (setq args (append args (list "--system-prompt" system-prompt)))))
+    ;; Model
+    (let ((model (or (plist-get options :model) claude-agent-default-model)))
+      (when model
+        (setq args (append args (list "--model" model)))))
+    ;; Max turns
+    (let ((max-turns (plist-get options :max-turns)))
+      (when max-turns
+        (setq args (append args (list "--max-turns" (number-to-string max-turns))))))
+    ;; Max budget
+    (let ((max-budget (plist-get options :max-budget-usd)))
+      (when max-budget
+        (setq args (append args (list "--max-budget-usd" (number-to-string max-budget))))))
+    ;; Permission mode
+    (let ((perm-mode (plist-get options :permission-mode)))
+      (when perm-mode
+        (let ((mode-str (claude-agent--permission-mode-to-string perm-mode)))
+          (when mode-str
+            (setq args (append args (list "--permission-mode" mode-str)))))))
+    ;; Allowed tools
+    (let ((allowed-tools (plist-get options :allowed-tools)))
+      (when allowed-tools
+        (setq args (append args (list "--allowedTools"
+                                      (string-join allowed-tools ","))))))
+    ;; Disallowed tools
+    (let ((disallowed-tools (plist-get options :disallowed-tools)))
+      (when disallowed-tools
+        (setq args (append args (list "--disallowedTools"
+                                      (string-join disallowed-tools ","))))))
+    ;; Continue conversation
+    (when (plist-get options :continue-conversation)
+      (setq args (append args (list "--continue"))))
+    ;; Resume session
+    (let ((resume (plist-get options :resume)))
+      (when resume
+        (setq args (append args (list "--resume" resume)))))
+    ;; Streaming input mode
+    (if streaming-p
+        (setq args (append args (list "--input-format" "stream-json")))
+      ;; Non-streaming: --print flag will be added with prompt
+      (setq args (append args (list "--print"))))
+    args))
+#+END_SRC
+
+** Process State
+
+Internal state structure for managing async process communication.
+
+#+BEGIN_SRC elisp
+(cl-defstruct (claude-agent--process-state
+               (:constructor claude-agent--make-process-state)
+               (:copier nil))
+  "Internal process state for async operations."
+  process           ; Emacs process object
+  buffer            ; Output buffer
+  json-buffer       ; Accumulated partial JSON string
+  callback          ; Message callback function
+  error-callback    ; Error callback function
+  complete-callback ; Completion callback function
+  options           ; Original options plist
+  (ready nil)       ; Boolean ready state
+  (closed nil))     ; Boolean closed state
+
+(defvar claude-agent--active-states nil
+  "List of active process states for cleanup.")
+#+END_SRC
+
+** Process Filter
+
+The process filter accumulates JSON data and parses complete messages.
+
+#+BEGIN_SRC elisp
+(defun claude-agent--debug-log (format-string &rest args)
+  "Log debug message if `claude-agent-debug' is non-nil."
+  (when claude-agent-debug
+    (apply #'message (concat "[claude-agent] " format-string) args)))
+
+(defun claude-agent--process-json-buffer (process)
+  "Process accumulated JSON for PROCESS.
+PROCESS has state stored via `process-get'.
+Parses complete newline-delimited JSON and invokes callbacks."
+  (let* ((state (process-get process 'claude-agent-state))
+         (buf (claude-agent--process-state-json-buffer state))
+         (callback (claude-agent--process-state-callback state))
+         (error-callback (claude-agent--process-state-error-callback state)))
+    (while (string-match "^\\([^\n]+\\)\n" buf)
+      (let* ((line (match-string 1 buf))
+             (rest (substring buf (match-end 0))))
+        (setf (claude-agent--process-state-json-buffer state) rest)
+        (setq buf rest)
+        (when (and line (not (string-empty-p (string-trim line))))
+          (condition-case err
+              (let* ((json-object-type 'plist)
+                     (json-array-type 'list)
+                     (json-key-type 'keyword)
+                     (parsed (json-read-from-string line)))
+                (claude-agent--debug-log "Parsed JSON: %S" (plist-get parsed :type))
+                (when callback
+                  (let ((message (claude-agent--parse-message parsed)))
+                    (when message
+                      (funcall callback message)))))
+            (json-parse-error
+             (claude-agent--debug-log "JSON parse error: %s" (error-message-string err))
+             (when error-callback
+               (funcall error-callback
+                        (list 'claude-agent-json-decode-error
+                              :line line
+                              :original-error err))))))))))
+
+(defun claude-agent--process-filter (process output)
+  "Process filter function for PROCESS.
+OUTPUT is the data received from the process.
+Uses `process-get' to retrieve state instead of closures (for dynamic binding compat)."
+  (let ((state (process-get process 'claude-agent-state)))
+    (when (and state (claude-agent--process-state-ready state))
+      (let ((json-buf (or (claude-agent--process-state-json-buffer state) "")))
+        (setf (claude-agent--process-state-json-buffer state)
+              (concat json-buf output))
+        (claude-agent--process-json-buffer process)))))
+#+END_SRC
+
+** Process Sentinel
+
+The sentinel handles process completion and cleanup.
+
+#+BEGIN_SRC elisp
+(defun claude-agent--process-sentinel (process event)
+  "Process sentinel function for PROCESS.
+EVENT is the process event string.
+Uses `process-get' to retrieve state instead of closures (for dynamic binding compat)."
+  (let ((state (process-get process 'claude-agent-state)))
+    (claude-agent--debug-log "Process event: %s" (string-trim event))
+    (when state
+      (setf (claude-agent--process-state-closed state) t)
+      (setf (claude-agent--process-state-ready state) nil)
+      ;; Process any remaining JSON in buffer
+      (claude-agent--process-json-buffer process)
+      ;; Call completion callback
+      (let ((complete-cb (claude-agent--process-state-complete-callback state)))
+        (cond
+         ((string-match-p "finished" event)
+          (when complete-cb
+            (funcall complete-cb nil)))
+         ((string-match-p "exited abnormally" event)
+          (let ((exit-code (when (string-match "code \\([0-9]+\\)" event)
+                             (string-to-number (match-string 1 event)))))
+            (when complete-cb
+              (funcall complete-cb
+                       (list 'claude-agent-process-error
+                             :message "Process exited abnormally"
+                             :exit-code exit-code)))))
+         (t
+          (when complete-cb
+            (funcall complete-cb
+                     (list 'claude-agent-process-error
+                           :message (format "Process event: %s" event)))))))
+      ;; Cleanup
+      (setq claude-agent--active-states
+            (delq state claude-agent--active-states))
+      (when-let ((buf (claude-agent--process-state-buffer state)))
+        (when (buffer-live-p buf)
+          (kill-buffer buf))))))
+#+END_SRC
+
+** Process Creation
+
+#+BEGIN_SRC elisp
+(defun claude-agent--start-process (prompt options callback error-callback complete-callback)
+  "Start Claude CLI process with PROMPT and OPTIONS.
+
+CALLBACK is called with each parsed message.
+ERROR-CALLBACK is called on errors.
+COMPLETE-CALLBACK is called when process completes.
+
+Returns a process state object."
+  (let* ((cli-path (or (plist-get options :cli-path)
+                       (claude-agent--find-cli)))
+         (args (claude-agent--build-args options nil))
+         (cwd (plist-get options :cwd))
+         (env-vars (plist-get options :env))
+         (state (claude-agent--make-process-state
+                 :options options
+                 :json-buffer ""
+                 :callback callback
+                 :error-callback error-callback
+                 :complete-callback complete-callback
+                 :ready nil
+                 :closed nil))
+         ;; Note: We use :connection-type 'pipe in make-process below
+         (default-directory (or cwd default-directory))
+         (process-environment (append
+                               (mapcar (lambda (pair)
+                                         (format "%s=%s" (car pair) (cdr pair)))
+                                       env-vars)
+                               process-environment)))
+    ;; Add prompt to args
+    (setq args (append args (list "--" prompt)))
+    (claude-agent--debug-log "Starting CLI: %s %s" cli-path args)
+    (let ((process (make-process
+                    :name "claude-agent"
+                    :command (cons cli-path args)
+                    :buffer (generate-new-buffer " *claude-agent*")
+                    :connection-type 'pipe  ;; Use pipe, not PTY
+                    :filter #'claude-agent--process-filter
+                    :sentinel #'claude-agent--process-sentinel
+                    :coding 'utf-8-unix
+                    :noquery t)))
+      ;; Store state on process for filter/sentinel to access
+      ;; (avoids closure issues with dynamic binding)
+      (process-put process 'claude-agent-state state)
+      (setf (claude-agent--process-state-process state) process)
+      (setf (claude-agent--process-state-buffer state) (process-buffer process))
+      (setf (claude-agent--process-state-ready state) t)
+      ;; KEY: Close stdin immediately for non-interactive --print mode
+      ;; This signals EOF to the CLI, allowing it to proceed
+      (process-send-eof process)
+      (push state claude-agent--active-states)
+      state)))
+#+END_SRC
+
+* JSON Protocol
+
+** Content Block Parsing
+
+#+BEGIN_SRC elisp
+(defun claude-agent--parse-content-block (block)
+  "Parse a content BLOCK plist into appropriate struct."
+  (let ((type (plist-get block :type)))
+    (pcase type
+      ("text"
+       (claude-agent-make-text-block
+        :text (plist-get block :text)))
+      ("thinking"
+       (claude-agent-make-thinking-block
+        :thinking (plist-get block :thinking)
+        :signature (plist-get block :signature)))
+      ("tool_use"
+       (claude-agent-make-tool-use-block
+        :id (plist-get block :id)
+        :name (plist-get block :name)
+        :input (plist-get block :input)))
+      ("tool_result"
+       (claude-agent-make-tool-result-block
+        :tool-use-id (plist-get block :tool_use_id)
+        :content (plist-get block :content)
+        :is-error (plist-get block :is_error)))
+      (_ block)))) ; Return raw block for unknown types
+#+END_SRC
+
+** Message Parsing
+
+#+BEGIN_SRC elisp
+(defun claude-agent--parse-content-blocks (blocks)
+  "Parse a list of content BLOCKS."
+  (when blocks
+    (mapcar #'claude-agent--parse-content-block blocks)))
+
+(defun claude-agent--parse-message (json)
+  "Parse a JSON plist into appropriate message struct."
+  (let ((type (plist-get json :type)))
+    (pcase type
+      ("user"
+       (let ((message (plist-get json :message)))
+         (claude-agent-make-user-message
+          :content (plist-get message :content)
+          :parent-tool-use-id (plist-get message :parent_tool_use_id))))
+      ("assistant"
+       (let ((message (plist-get json :message)))
+         (claude-agent-make-assistant-message
+          :content (claude-agent--parse-content-blocks
+                    (plist-get message :content))
+          :model (plist-get message :model)
+          :parent-tool-use-id (plist-get message :parent_tool_use_id)
+          :error (plist-get message :error))))
+      ("system"
+       (claude-agent-make-system-message
+        :subtype (plist-get json :subtype)
+        :data json))
+      ("result"
+       (claude-agent-make-result-message
+        :subtype (plist-get json :subtype)
+        :duration-ms (plist-get json :duration_ms)
+        :duration-api-ms (plist-get json :duration_api_ms)
+        :is-error (plist-get json :is_error)
+        :num-turns (plist-get json :num_turns)
+        :session-id (plist-get json :session_id)
+        :total-cost-usd (plist-get json :total_cost_usd)
+        :usage (plist-get json :usage)
+        :result (plist-get json :result)))
+      ;; Handle other message types as raw plists
+      (_ json))))
+#+END_SRC
+
+* Core API
+
+** Query Function
+
+#+BEGIN_SRC elisp
+(cl-defun claude-agent-query (prompt &key options on-message on-error on-complete)
+  "Send a one-shot query to Claude.
+
+PROMPT is the query string to send.
+
+OPTIONS is an optional plist created with `claude-agent-options'.
+
+ON-MESSAGE is called with each message as it arrives.
+  Function signature: (lambda (message) ...)
+  where MESSAGE is one of:
+    - `claude-agent-user-message'
+    - `claude-agent-assistant-message'
+    - `claude-agent-system-message'
+    - `claude-agent-result-message'
+
+ON-ERROR is called if an error occurs.
+  Function signature: (lambda (error) ...)
+
+ON-COMPLETE is called when the query finishes.
+  Function signature: (lambda (result-or-error) ...)
+
+Returns the process state object for potential interruption.
+
+Example:
+  (claude-agent-query
+   \"What is 2+2?\"
+   :on-message (lambda (msg)
+                 (when (claude-agent-assistant-message-p msg)
+                   (message \"Response: %s\"
+                            (claude-agent-extract-text msg))))
+   :on-complete (lambda (result)
+                  (message \"Done!\")))"
+  (unless prompt
+    (error "Prompt is required"))
+  (let ((opts (or options (claude-agent-options))))
+    (claude-agent--start-process
+     prompt
+     opts
+     on-message
+     on-error
+     on-complete)))
+
+(defun claude-agent-query-interrupt (state)
+  "Interrupt an ongoing query by STATE.
+STATE is the process state returned by `claude-agent-query'."
+  (when-let ((process (claude-agent--process-state-process state)))
+    (when (process-live-p process)
+      (interrupt-process process))))
+#+END_SRC
+
+** Helper Functions
+
+#+BEGIN_SRC elisp
+(defun claude-agent-extract-text (message)
+  "Extract text content from an assistant MESSAGE.
+Returns concatenated text from all text blocks, or nil if no text."
+  (when (claude-agent-assistant-message-p message)
+    (let ((texts nil))
+      (dolist (block (claude-agent-assistant-message-content message))
+        (when (claude-agent-text-block-p block)
+          (push (claude-agent-text-block-text block) texts)))
+      (when texts
+        (string-join (nreverse texts) "")))))
+
+(defun claude-agent-message-type (message)
+  "Get the type symbol for MESSAGE.
+Returns one of: user, assistant, system, result, or unknown."
+  (cond
+   ((claude-agent-user-message-p message) 'user)
+   ((claude-agent-assistant-message-p message) 'assistant)
+   ((claude-agent-system-message-p message) 'system)
+   ((claude-agent-result-message-p message) 'result)
+   (t 'unknown)))
+
+(defun claude-agent-extract-tool-uses (message)
+  "Extract tool use blocks from an assistant MESSAGE.
+Returns a list of `claude-agent-tool-use-block' structs."
+  (when (claude-agent-assistant-message-p message)
+    (cl-remove-if-not #'claude-agent-tool-use-block-p
+                      (claude-agent-assistant-message-content message))))
+
+(defun claude-agent-extract-thinking (message)
+  "Extract thinking content from an assistant MESSAGE.
+Returns concatenated thinking text, or nil if none."
+  (when (claude-agent-assistant-message-p message)
+    (let ((thoughts nil))
+      (dolist (block (claude-agent-assistant-message-content message))
+        (when (claude-agent-thinking-block-p block)
+          (push (claude-agent-thinking-block-thinking block) thoughts)))
+      (when thoughts
+        (string-join (nreverse thoughts) "\n")))))
+#+END_SRC
+
+* Client API
+
+The client API provides bidirectional interactive conversations.
+
+** Client Structure
+
+#+BEGIN_SRC elisp
+(cl-defstruct (claude-agent-client
+               (:constructor claude-agent--make-client)
+               (:copier nil))
+  "Interactive Claude client for bidirectional conversations.
+
+Use `claude-agent-client-create' to construct instances."
+  state           ; Process state
+  options         ; Options plist
+  session-id      ; Current session ID
+  (connected-p nil) ; Boolean connection state
+  hooks           ; Alist of (event . matchers)
+  message-queue   ; Queue of pending messages
+  on-message      ; Default message callback
+  on-error)       ; Default error callback
+#+END_SRC
+
+** Client Creation
+
+#+BEGIN_SRC elisp
+(cl-defun claude-agent-client-create (&key options on-message on-error)
+  "Create a new Claude client.
+
+OPTIONS is a plist created with `claude-agent-options'.
+ON-MESSAGE is the default callback for received messages.
+ON-ERROR is the default callback for errors.
+
+Returns a `claude-agent-client' struct.
+
+Example:
+  (setq my-client
+        (claude-agent-client-create
+         :options (claude-agent-options
+                   :model \"claude-sonnet-4-5\"
+                   :permission-mode 'accept-edits)
+         :on-message (lambda (msg) (message \"Got: %s\" msg))))"
+  (claude-agent--make-client
+   :options (or options (claude-agent-options))
+   :hooks (plist-get options :hooks)
+   :message-queue nil
+   :on-message on-message
+   :on-error on-error
+   :connected-p nil))
+#+END_SRC
+
+** Client Methods
+
+#+BEGIN_SRC elisp
+(defun claude-agent-client-connect (client &optional initial-prompt)
+  "Connect CLIENT to Claude with optional INITIAL-PROMPT.
+
+Starts the CLI process in streaming mode."
+  (when (claude-agent-client-connected-p client)
+    (error "Client is already connected"))
+  (let* ((options (claude-agent-client-options client))
+         (prompt (or initial-prompt ""))
+         (on-msg (claude-agent-client-on-message client))
+         (on-err (claude-agent-client-on-error client)))
+    (setf (claude-agent-client-state client)
+          (claude-agent--start-process
+           prompt
+           options
+           (lambda (msg)
+             ;; Track session ID from result messages
+             (when (claude-agent-result-message-p msg)
+               (setf (claude-agent-client-session-id client)
+                     (claude-agent-result-message-session-id msg)))
+             ;; Call user callback
+             (when on-msg
+               (funcall on-msg msg)))
+           on-err
+           (lambda (result)
+             (setf (claude-agent-client-connected-p client) nil)
+             (when (and result on-err)
+               (funcall on-err result)))))
+    (setf (claude-agent-client-connected-p client) t)
+    client))
+
+(cl-defun claude-agent-client-send (client message &key on-response on-error)
+  "Send MESSAGE through CLIENT.
+
+MESSAGE is a string to send to Claude.
+ON-RESPONSE is called with each response message.
+ON-ERROR is called if an error occurs.
+
+Note: This creates a new query process. For true bidirectional
+streaming, use the streaming input mode (future feature)."
+  (unless (claude-agent-client-connected-p client)
+    (error "Client is not connected"))
+  ;; For now, start a new process for each message
+  ;; Future: implement true bidirectional streaming
+  (let* ((options (claude-agent-client-options client))
+         ;; Continue from previous session if we have one
+         (session-id (claude-agent-client-session-id client))
+         (new-options (if session-id
+                          (plist-put (copy-sequence options) :resume session-id)
+                        options)))
+    (setf (claude-agent-client-state client)
+          (claude-agent--start-process
+           message
+           new-options
+           (or on-response (claude-agent-client-on-message client))
+           (or on-error (claude-agent-client-on-error client))
+           (lambda (result)
+             (when (and result (claude-agent-client-on-error client))
+               (funcall (claude-agent-client-on-error client) result)))))))
+
+(defun claude-agent-client-disconnect (client)
+  "Disconnect CLIENT from Claude.
+
+Cleans up process and resources."
+  (when (claude-agent-client-connected-p client)
+    (when-let ((state (claude-agent-client-state client)))
+      (when-let ((process (claude-agent--process-state-process state)))
+        (when (process-live-p process)
+          (delete-process process)))
+      (when-let ((buf (claude-agent--process-state-buffer state)))
+        (when (buffer-live-p buf)
+          (kill-buffer buf))))
+    (setf (claude-agent-client-connected-p client) nil)
+    (setf (claude-agent-client-state client) nil)))
+
+(defun claude-agent-client-interrupt (client)
+  "Send interrupt signal through CLIENT."
+  (when-let ((state (claude-agent-client-state client)))
+    (when-let ((process (claude-agent--process-state-process state)))
+      (when (process-live-p process)
+        (interrupt-process process)))))
+#+END_SRC
+
+* Hook System
+
+** Hook Input Structures
+
+#+BEGIN_SRC elisp
+(cl-defstruct (claude-agent-pre-tool-use-input
+               (:constructor claude-agent-make-pre-tool-use-input)
+               (:copier nil))
+  "Input for PreToolUse hooks."
+  session-id
+  tool-name
+  tool-input
+  cwd
+  permission-mode)
+
+(cl-defstruct (claude-agent-post-tool-use-input
+               (:constructor claude-agent-make-post-tool-use-input)
+               (:copier nil))
+  "Input for PostToolUse hooks."
+  session-id
+  tool-name
+  tool-input
+  tool-response
+  cwd)
+
+(cl-defstruct (claude-agent-stop-input
+               (:constructor claude-agent-make-stop-input)
+               (:copier nil))
+  "Input for Stop hooks."
+  session-id
+  stop-hook-active)
+#+END_SRC
+
+** Hook Invocation
+
+#+BEGIN_SRC elisp
+(defun claude-agent-add-hook (client event matcher callback &optional timeout)
+  "Add a hook to CLIENT for EVENT.
+
+EVENT is one of `claude-agent-hook-events'.
+MATCHER is a string pattern (tool name) or nil for all.
+CALLBACK is called when the hook fires.
+  For PreToolUse: (lambda (input) ...) where INPUT is `claude-agent-pre-tool-use-input'
+    Return plist with :decision (allow, deny, ask)
+  For PostToolUse: (lambda (input) ...) where INPUT is `claude-agent-post-tool-use-input'
+    Return plist with :additional-context string
+  For Stop: (lambda (input) ...) where INPUT is `claude-agent-stop-input'
+    Return plist with :continue boolean
+TIMEOUT is optional seconds before hook times out."
+  (unless (memq event claude-agent-hook-events)
+    (error "Unknown hook event: %s" event))
+  (let* ((hooks (claude-agent-client-hooks client))
+         (matchers (alist-get event hooks))
+         (new-matcher (claude-agent-make-hook-matcher
+                       :matcher matcher
+                       :callbacks (list callback)
+                       :timeout (or timeout 60.0))))
+    (if matchers
+        (setf (alist-get event hooks)
+              (append matchers (list new-matcher)))
+      (push (cons event (list new-matcher)) hooks))
+    (setf (claude-agent-client-hooks client) hooks)))
+
+(defun claude-agent--invoke-hooks (client event input)
+  "Invoke hooks on CLIENT for EVENT with INPUT.
+Returns combined hook output plist."
+  (let ((hooks (claude-agent-client-hooks client))
+        (results nil))
+    (when-let ((matchers (alist-get event hooks)))
+      (dolist (matcher matchers)
+        (let ((pattern (claude-agent-hook-matcher-matcher matcher))
+              (callbacks (claude-agent-hook-matcher-callbacks matcher))
+              (tool-name (and (claude-agent-pre-tool-use-input-p input)
+                              (claude-agent-pre-tool-use-input-tool-name input))))
+          ;; Check if matcher applies
+          (when (or (null pattern)
+                    (and tool-name (string-match-p pattern tool-name)))
+            (dolist (callback callbacks)
+              (condition-case err
+                  (let ((result (funcall callback input)))
+                    (when result
+                      (push result results)))
+                (error
+                 (claude-agent--debug-log "Hook error: %s" (error-message-string err)))))))))
+    ;; Combine results (last result wins for conflicting keys)
+    (apply #'append (nreverse results))))
+#+END_SRC
+
+* Session Management
+
+#+BEGIN_SRC elisp
+(defun claude-agent-continue-session (client)
+  "Configure CLIENT to continue from the previous session.
+Must be called before `claude-agent-client-connect'."
+  (let ((options (claude-agent-client-options client)))
+    (setf (claude-agent-client-options client)
+          (plist-put options :continue-conversation t))))
+
+(defun claude-agent-resume-session (client session-id)
+  "Configure CLIENT to resume SESSION-ID.
+Must be called before `claude-agent-client-connect'."
+  (let ((options (claude-agent-client-options client)))
+    (setf (claude-agent-client-options client)
+          (plist-put options :resume session-id))))
+
+(defun claude-agent-get-session-id (client)
+  "Get the current session ID from CLIENT.
+Returns nil if not yet available."
+  (claude-agent-client-session-id client))
+#+END_SRC
+
+* Tests
+
+** Unit Tests
+
+#+BEGIN_SRC elisp :load test
+(require 'ert)
+
+(ert-deftest claude-agent-test-options-creation ()
+  "Test options plist creation."
+  (let ((opts (claude-agent-options
+               :model "claude-sonnet-4-5"
+               :max-turns 5)))
+    (should (equal (plist-get opts :model) "claude-sonnet-4-5"))
+    (should (equal (plist-get opts :max-turns) 5))
+    (should (null (plist-get opts :system-prompt)))))
+
+(ert-deftest claude-agent-test-options-defaults ()
+  "Test options defaults."
+  (let ((opts (claude-agent-options)))
+    (should (null (plist-get opts :model)))
+    (should (null (plist-get opts :max-turns)))
+    (should (null (plist-get opts :permission-mode)))))
+
+(ert-deftest claude-agent-test-permission-mode-conversion ()
+  "Test permission mode symbol to string conversion."
+  (should (equal (claude-agent--permission-mode-to-string 'default) "default"))
+  (should (equal (claude-agent--permission-mode-to-string 'accept-edits) "acceptEdits"))
+  (should (equal (claude-agent--permission-mode-to-string 'plan) "plan"))
+  (should (equal (claude-agent--permission-mode-to-string 'bypass-permissions) "bypassPermissions"))
+  (should (equal (claude-agent--permission-mode-to-string "custom") "custom"))
+  (should (null (claude-agent--permission-mode-to-string nil))))
+
+(ert-deftest claude-agent-test-build-args-basic ()
+  "Test basic argument building."
+  (let* ((opts (claude-agent-options :model "test-model" :max-turns 3))
+         (args (claude-agent--build-args opts nil)))
+    (should (member "--output-format" args))
+    (should (member "stream-json" args))
+    (should (member "--model" args))
+    (should (member "test-model" args))
+    (should (member "--max-turns" args))
+    (should (member "3" args))
+    (should (member "--print" args))))
+
+(ert-deftest claude-agent-test-build-args-permission-mode ()
+  "Test argument building with permission mode."
+  (let* ((opts (claude-agent-options :permission-mode 'accept-edits))
+         (args (claude-agent--build-args opts nil)))
+    (should (member "--permission-mode" args))
+    (should (member "acceptEdits" args))))
+
+(ert-deftest claude-agent-test-build-args-tools ()
+  "Test argument building with tools."
+  (let* ((opts (claude-agent-options
+                :allowed-tools '("Read" "Write")
+                :disallowed-tools '("Bash")))
+         (args (claude-agent--build-args opts nil)))
+    (should (member "--allowedTools" args))
+    (should (member "Read,Write" args))
+    (should (member "--disallowedTools" args))
+    (should (member "Bash" args))))
+
+(ert-deftest claude-agent-test-parse-text-block ()
+  "Test parsing text content block."
+  (let ((block (claude-agent--parse-content-block
+                '(:type "text" :text "Hello world"))))
+    (should (claude-agent-text-block-p block))
+    (should (equal (claude-agent-text-block-text block) "Hello world"))))
+
+(ert-deftest claude-agent-test-parse-tool-use-block ()
+  "Test parsing tool use content block."
+  (let ((block (claude-agent--parse-content-block
+                '(:type "tool_use"
+                  :id "tool_123"
+                  :name "Read"
+                  :input (:path "/tmp/test.txt")))))
+    (should (claude-agent-tool-use-block-p block))
+    (should (equal (claude-agent-tool-use-block-id block) "tool_123"))
+    (should (equal (claude-agent-tool-use-block-name block) "Read"))
+    (should (equal (plist-get (claude-agent-tool-use-block-input block) :path)
+                   "/tmp/test.txt"))))
+
+(ert-deftest claude-agent-test-parse-assistant-message ()
+  "Test parsing assistant message."
+  (let ((msg (claude-agent--parse-message
+              '(:type "assistant"
+                :message (:content ((:type "text" :text "Hello"))
+                          :model "claude-sonnet-4-5")))))
+    (should (claude-agent-assistant-message-p msg))
+    (should (equal (claude-agent-assistant-message-model msg) "claude-sonnet-4-5"))
+    (should (= (length (claude-agent-assistant-message-content msg)) 1))
+    (should (claude-agent-text-block-p
+             (car (claude-agent-assistant-message-content msg))))))
+
+(ert-deftest claude-agent-test-parse-result-message ()
+  "Test parsing result message."
+  (let ((msg (claude-agent--parse-message
+              '(:type "result"
+                :subtype "success"
+                :session_id "sess_123"
+                :total_cost_usd 0.01
+                :num_turns 1))))
+    (should (claude-agent-result-message-p msg))
+    (should (equal (claude-agent-result-message-session-id msg) "sess_123"))
+    (should (equal (claude-agent-result-message-total-cost-usd msg) 0.01))
+    (should (equal (claude-agent-result-message-num-turns msg) 1))))
+
+(ert-deftest claude-agent-test-extract-text ()
+  "Test extracting text from assistant message."
+  (let ((msg (claude-agent-make-assistant-message
+              :content (list (claude-agent-make-text-block :text "Hello ")
+                             (claude-agent-make-text-block :text "World"))
+              :model "test")))
+    (should (equal (claude-agent-extract-text msg) "Hello World"))))
+
+(ert-deftest claude-agent-test-extract-text-no-text ()
+  "Test extracting text when no text blocks."
+  (let ((msg (claude-agent-make-assistant-message
+              :content (list (claude-agent-make-tool-use-block
+                              :id "1" :name "Test" :input nil))
+              :model "test")))
+    (should (null (claude-agent-extract-text msg)))))
+
+(ert-deftest claude-agent-test-message-type ()
+  "Test message type detection."
+  (should (eq (claude-agent-message-type
+               (claude-agent-make-user-message :content "test"))
+              'user))
+  (should (eq (claude-agent-message-type
+               (claude-agent-make-assistant-message :content nil :model "test"))
+              'assistant))
+  (should (eq (claude-agent-message-type
+               (claude-agent-make-system-message :subtype "init" :data nil))
+              'system))
+  (should (eq (claude-agent-message-type
+               (claude-agent-make-result-message :subtype "success"))
+              'result))
+  (should (eq (claude-agent-message-type "unknown") 'unknown)))
+
+(ert-deftest claude-agent-test-client-creation ()
+  "Test client creation."
+  (let ((client (claude-agent-client-create
+                 :options (claude-agent-options :model "test"))))
+    (should (claude-agent-client-p client))
+    (should (not (claude-agent-client-connected-p client)))
+    (should (null (claude-agent-client-session-id client)))))
+
+(ert-deftest claude-agent-test-hook-events ()
+  "Test hook events constant."
+  (should (memq 'PreToolUse claude-agent-hook-events))
+  (should (memq 'PostToolUse claude-agent-hook-events))
+  (should (memq 'Stop claude-agent-hook-events)))
+#+END_SRC
+
+* Interactive Chat Mode
+
+This section provides an interactive chat interface based on comint-mode,
+allowing users to interact with Claude in a REPL-like environment.
+
+** Chat Mode Variables
+
+#+BEGIN_SRC elisp
+(defgroup claude-agent-chat nil
+  "Interactive chat interface for Claude Agent."
+  :group 'claude-agent
+  :prefix "claude-agent-chat-")
+
+(defcustom claude-agent-chat-prompt "You> "
+  "Prompt string for user input in chat mode."
+  :type 'string
+  :group 'claude-agent-chat)
+
+(defcustom claude-agent-chat-buffer-name "*Claude Chat*"
+  "Name of the Claude chat buffer."
+  :type 'string
+  :group 'claude-agent-chat)
+
+(defcustom claude-agent-chat-show-system-messages nil
+  "Whether to display system messages in the chat buffer."
+  :type 'boolean
+  :group 'claude-agent-chat)
+
+(defcustom claude-agent-chat-show-cost t
+  "Whether to display cost information after each response."
+  :type 'boolean
+  :group 'claude-agent-chat)
+
+(defvar-local claude-agent-chat--session-id nil
+  "Current session ID for conversation continuity.")
+
+(defvar-local claude-agent-chat--waiting nil
+  "Non-nil when waiting for Claude's response.")
+
+(defvar-local claude-agent-chat--current-response ""
+  "Accumulator for the current streaming response.")
+
+(defvar-local claude-agent-chat--response-start-marker nil
+  "Marker for the start of the current response.")
+
+(defvar-local claude-agent-chat--total-cost 0.0
+  "Total cost accumulated in this chat session.")
+#+END_SRC
+
+** Chat Mode Faces
+
+#+BEGIN_SRC elisp
+(defface claude-agent-chat-prompt-face
+  '((t :inherit comint-highlight-prompt))
+  "Face for the user prompt in Claude chat."
+  :group 'claude-agent-chat)
+
+(defface claude-agent-chat-response-face
+  '((t :inherit default))
+  "Face for Claude's responses."
+  :group 'claude-agent-chat)
+
+(defface claude-agent-chat-thinking-face
+  '((t :inherit font-lock-comment-face :slant italic))
+  "Face for thinking indicators."
+  :group 'claude-agent-chat)
+
+(defface claude-agent-chat-tool-face
+  '((t :inherit font-lock-function-name-face))
+  "Face for tool use indicators."
+  :group 'claude-agent-chat)
+
+(defface claude-agent-chat-error-face
+  '((t :inherit error))
+  "Face for error messages."
+  :group 'claude-agent-chat)
+
+(defface claude-agent-chat-info-face
+  '((t :inherit font-lock-comment-face))
+  "Face for informational messages like cost."
+  :group 'claude-agent-chat)
+#+END_SRC
+
+** Chat Mode Functions
+
+#+BEGIN_SRC elisp
+(defun claude-agent-chat--insert (text &optional face)
+  "Insert TEXT at the end of the chat buffer with optional FACE."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (goto-char (point-max))
+      (let ((start (point)))
+        (insert text)
+        (when face
+          (add-text-properties start (point) (list 'face face)))))))
+
+(defun claude-agent-chat--insert-response-start ()
+  "Insert the response header and set up markers."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (goto-char (point-max))
+      (insert "\nClaude> ")
+      (add-text-properties (- (point) 8) (point)
+                           '(face claude-agent-chat-response-face
+                             font-lock-face claude-agent-chat-response-face))
+      (setq claude-agent-chat--response-start-marker (point-marker)))))
+
+(defun claude-agent-chat--update-response (text)
+  "Update the current response with TEXT (streaming update)."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (goto-char claude-agent-chat--response-start-marker)
+      (delete-region (point) (point-max))
+      (insert text))))
+
+(defun claude-agent-chat--handle-message (msg)
+  "Handle incoming MSG from Claude."
+  (with-current-buffer claude-agent-chat-buffer-name
+    (let ((type (claude-agent-message-type msg)))
+      (pcase type
+        ('system
+         (when claude-agent-chat-show-system-messages
+           (let ((subtype (claude-agent-system-message-subtype msg)))
+             (claude-agent-chat--insert
+              (format "\n[System: %s]\n" subtype)
+              'claude-agent-chat-info-face))))
+
+        ('assistant
+         (let ((text (claude-agent-extract-text msg)))
+           (when text
+             (setq claude-agent-chat--current-response text)
+             (claude-agent-chat--update-response text)))
+         ;; Check for tool use
+         (let ((content (claude-agent-assistant-message-content msg)))
+           (dolist (block content)
+             (when (claude-agent-tool-use-block-p block)
+               (claude-agent-chat--insert
+                (format "\n[Tool: %s]\n"
+                        (claude-agent-tool-use-block-name block))
+                'claude-agent-chat-tool-face)))))
+
+        ('result
+         (setq claude-agent-chat--session-id
+               (claude-agent-result-message-session-id msg))
+         (let ((cost (claude-agent-result-message-total-cost-usd msg)))
+           (when cost
+             (setq claude-agent-chat--total-cost
+                   (+ claude-agent-chat--total-cost cost))
+             (when claude-agent-chat-show-cost
+               (claude-agent-chat--insert
+                (format "\n[Cost: $%.4f | Session total: $%.4f]\n"
+                        cost claude-agent-chat--total-cost)
+                'claude-agent-chat-info-face)))))))))
+
+(defun claude-agent-chat--handle-error (err)
+  "Handle error ERR from Claude."
+  (with-current-buffer claude-agent-chat-buffer-name
+    (claude-agent-chat--insert
+     (format "\n[Error: %s]\n" err)
+     'claude-agent-chat-error-face)
+    (setq claude-agent-chat--waiting nil)
+    (claude-agent-chat--show-prompt)))
+
+(defun claude-agent-chat--handle-complete (_result)
+  "Handle completion of Claude's response."
+  (with-current-buffer claude-agent-chat-buffer-name
+    (setq claude-agent-chat--waiting nil)
+    (setq claude-agent-chat--current-response "")
+    (claude-agent-chat--insert "\n")
+    (claude-agent-chat--show-prompt)))
+
+(defun claude-agent-chat--show-prompt ()
+  "Show the input prompt using comint."
+  (let ((inhibit-read-only t)
+        (proc (get-buffer-process (current-buffer))))
+    (goto-char (point-max))
+    (let ((start (point)))
+      (insert claude-agent-chat-prompt)
+      (add-text-properties start (point)
+                           '(face claude-agent-chat-prompt-face
+                             font-lock-face claude-agent-chat-prompt-face
+                             front-sticky (face font-lock-face read-only)
+                             rear-nonsticky t
+                             read-only t)))
+    (when proc
+      (set-marker (process-mark proc) (point)))))
+
+(defun claude-agent-chat--send-input (input)
+  "Send INPUT to Claude."
+  (when (and input (not (string-empty-p (string-trim input))))
+    (if claude-agent-chat--waiting
+        (message "Still waiting for Claude's response...")
+      (setq claude-agent-chat--waiting t)
+      (setq claude-agent-chat--current-response "")
+      (claude-agent-chat--insert-response-start)
+      (claude-agent-chat--insert "[Waiting...]" 'claude-agent-chat-thinking-face)
+      ;; Build options with session continuation if we have a session
+      (let ((opts (if claude-agent-chat--session-id
+                      (claude-agent-options
+                       :continue-conversation t
+                       :resume claude-agent-chat--session-id)
+                    (claude-agent-options))))
+        (claude-agent-query
+         input
+         :options opts
+         :on-message #'claude-agent-chat--handle-message
+         :on-error #'claude-agent-chat--handle-error
+         :on-complete #'claude-agent-chat--handle-complete)))))
+
+(defun claude-agent-chat-interrupt ()
+  "Interrupt the current Claude request."
+  (interactive)
+  (claude-agent-cleanup)
+  (with-current-buffer claude-agent-chat-buffer-name
+    (setq claude-agent-chat--waiting nil)
+    (claude-agent-chat--insert "\n[Interrupted]\n" 'claude-agent-chat-error-face)
+    (claude-agent-chat--show-prompt)))
+
+(defun claude-agent-chat-clear ()
+  "Clear the chat buffer and reset the session."
+  (interactive)
+  (when (yes-or-no-p "Clear chat history and start new session? ")
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (setq claude-agent-chat--session-id nil)
+      (setq claude-agent-chat--total-cost 0.0)
+      (setq claude-agent-chat--waiting nil)
+      (claude-agent-chat--initialize-buffer))))
+
+(defun claude-agent-chat-new-session ()
+  "Start a new conversation session without clearing history."
+  (interactive)
+  (setq claude-agent-chat--session-id nil)
+  (claude-agent-chat--insert "\n--- New Session ---\n" 'claude-agent-chat-info-face)
+  (message "Started new session"))
+#+END_SRC
+
+** Chat Mode Definition
+
+#+BEGIN_SRC elisp
+(require 'comint)
+
+(defvar claude-agent-chat-mode-map
+  (let ((map (nconc (make-sparse-keymap) comint-mode-map)))
+    (define-key map (kbd "C-c C-k") #'claude-agent-chat-interrupt)
+    (define-key map (kbd "C-c C-l") #'claude-agent-chat-clear)
+    (define-key map (kbd "C-c C-n") #'claude-agent-chat-new-session)
+    map)
+  "Keymap for `claude-agent-chat-mode'.")
+
+(defun claude-agent-chat--input-sender (_proc input)
+  "Send INPUT to Claude (comint input sender).
+_PROC is ignored since we don't use a real process."
+  (claude-agent-chat--send-input input))
+
+(define-derived-mode claude-agent-chat-mode comint-mode "Claude-Chat"
+  "Major mode for interactive chat with Claude.
+Based on comint-mode for proper input handling.
+
+\\{claude-agent-chat-mode-map}"
+  :group 'claude-agent-chat
+  ;; Set up local variables
+  (setq-local claude-agent-chat--session-id nil)
+  (setq-local claude-agent-chat--waiting nil)
+  (setq-local claude-agent-chat--current-response "")
+  (setq-local claude-agent-chat--total-cost 0.0)
+  (setq-local claude-agent-chat--response-start-marker nil)
+  ;; Comint configuration
+  (setq-local comint-prompt-regexp (concat "^" (regexp-quote claude-agent-chat-prompt)))
+  (setq-local comint-input-sender #'claude-agent-chat--input-sender)
+  (setq-local comint-process-echoes nil)
+  ;; We don't have a real process, so we need a dummy
+  ;; The input sender handles everything
+  )
+
+(defun claude-agent-chat--initialize-buffer ()
+  "Initialize the chat buffer with header and prompt."
+  (let ((inhibit-read-only t))
+    (insert "Claude Agent Chat\n")
+    (insert "================\n")
+    (insert (format "CLI: %s\n" (claude-agent--find-cli)))
+    (insert "Type your message and press RET to send.\n")
+    (insert "Commands: C-c C-k (interrupt), C-c C-l (clear), C-c C-n (new session)\n\n")
+    ;; Set the prompt using comint's mechanism
+    (setq-local comint-prompt-read-only t)
+    (insert claude-agent-chat-prompt)
+    (set-marker (process-mark (get-buffer-process (current-buffer))) (point))))
+#+END_SRC
+
+** Main Entry Point
+
+#+BEGIN_SRC elisp
+;;;###autoload
+(defun claude-agent-chat ()
+  "Start or switch to the Claude chat buffer."
+  (interactive)
+  ;; Check for CLI first
+  (unless (claude-agent--find-cli)
+    (user-error "Claude CLI not found. Set `claude-agent-cli-path' or install Claude Code CLI"))
+  (let ((buf (get-buffer-create claude-agent-chat-buffer-name)))
+    (with-current-buffer buf
+      (unless (eq major-mode 'claude-agent-chat-mode)
+        (claude-agent-chat-mode)
+        ;; Start a fake process for comint to work with
+        ;; We use 'cat' as a simple no-op process
+        (let ((proc (start-process "claude-chat" buf "cat")))
+          (set-process-query-on-exit-flag proc nil)
+          (set-process-filter proc #'claude-agent-chat--comint-filter))
+        (claude-agent-chat--initialize-buffer)))
+    (pop-to-buffer buf)
+    (goto-char (point-max))))
+
+(defun claude-agent-chat--comint-filter (_proc _output)
+  "Filter for the dummy comint process.
+Ignores all output from the dummy process."
+  ;; Do nothing - we handle output ourselves
+  nil)
+#+END_SRC
+
+* Package Footer
+
+#+BEGIN_SRC elisp
+(provide 'claude-agent)
+;;; claude-agent.el ends here
+#+END_SRC
+
+* Release
+
+This section contains the tangle configuration for generating the
+standalone ~claude-agent.el~ file.
+
+#+BEGIN_SRC elisp :load no
+;; To tangle this file to claude-agent.el, evaluate:
+(require 'literate-elisp)
+(literate-elisp-tangle
+ "claude-agent.org"
+ :header ";;; claude-agent.el --- Emacs client for Claude Code CLI -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2024 Jingtao Xu
+
+;; Author: Jingtao Xu
+;; Version: 0.1.0
+;; Package-Requires: ((emacs \"27.1\"))
+;; Keywords: tools, processes, ai
+;; URL: https://github.com/user/claude-agent
+
+;; This file is not part of GNU Emacs.
+
+;; This file is auto-generated from claude-agent.org
+;; DO NOT EDIT DIRECTLY - edit claude-agent.org instead.
+
+;;; Commentary:
+
+;; Claude Agent SDK for Emacs - A client library for the Claude Code CLI.
+;; This package provides async subprocess communication with Claude,
+;; streaming responses, and hook support.
+;;
+;; Usage:
+;;   (claude-agent-query \"What is 2+2?\"
+;;     :on-message (lambda (msg) (message \"%s\" msg)))
+
+;;; Code:
+
+"
+ :tail "
+(provide 'claude-agent)
+;;; claude-agent.el ends here
+")
+#+END_SRC
